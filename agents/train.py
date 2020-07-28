@@ -56,6 +56,12 @@ def main_with_seed(eval_setup_name, fold_id, use_test_split,
     train_task_ids, eval_task_ids = get_train_test(eval_setup_name, fold_id,
                                                    use_test_split)
 
+    # CUSTOM TASK FILTER
+    train_task_ids = [t for t in train_task_ids if t.startswith('00013:')]
+    eval_task_ids = [t for t in eval_task_ids if t.startswith('00013:')]
+
+
+
     agent_kwargs['tier'] = phyre.eval_setup_to_action_tier(eval_setup_name)
     agent = find_all_agents()[agent_type]
 

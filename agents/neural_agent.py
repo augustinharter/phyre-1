@@ -17,6 +17,7 @@ import glob
 import logging
 import os
 import time
+import pickle
 
 import numpy as np
 import torch
@@ -103,6 +104,7 @@ def compact_simulation_data_to_trainset(action_tier_name: str,
 
     simulator = phyre.initialize_simulator(task_ids, action_tier_name)
     observations = torch.LongTensor(simulator.initial_scenes)
+    print(observations.shape)
     return task_indices, is_solved, actions, simulator, observations
 
 
@@ -227,7 +229,9 @@ def train(output_dir,
           action_layers,
           action_hidden_size,
           cosine_scheduler,
-          dev_tasks_ids=None):
+          dev_tasks_ids=None,
+          train_action_paths = None,
+          eval_action_paths = None):
 
     logging.info('Preprocessing train data')
 
@@ -260,6 +264,24 @@ def train(output_dir,
     model = build_model(**model_kwargs)
     model.train()
     model.to(device)
+    
+    # CUSTOM
+    model.path_rng = 10
+
+    #path = '/media/compute/homes/aharter/isy2020/phyre/data/action_path_fold_0'
+    """path = '/media/compute/homes/aharter/isy2020/phyre/data/template13_action_paths_10x'
+    if os.path.exists(path):
+        with open(path+'/channel_paths.pickle', 'rb') as fp:
+            action_path_dict = pickle.load(fp)
+        train_action_paths = torch.Tensor([action_path_dict[task] if task in action_path_dict else torch.zeros(256,256)
+            for task in task_ids])[:,None].to(device)
+        if dev_tasks_ids is not None:
+            eval_action_paths = torch.Tensor([action_path_dict[task] if task in action_path_dict else torch.zeros(256,256)
+            for task in dev_tasks_ids])[:,None].to(device)
+    else:
+        print("can't find action_path_dict!")
+        exit(-1)"""
+
     logging.info(model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -312,18 +334,18 @@ def train(output_dir,
         eval_batch_size = train_batch_size * 4
         stats = {}
         stats['batch_id'] = batch_id + 1
-        stats['train_loss'] = eval_loss(model, eval_train, eval_batch_size)
+        stats['train_loss'] = eval_loss(model, eval_train, eval_batch_size, action_paths=train_action_paths)
         if eval_dev:
-            stats['dev_loss'] = eval_loss(model, eval_dev, eval_batch_size)
+            stats['dev_loss'] = eval_loss(model, eval_dev, eval_batch_size, action_paths=eval_action_paths)
         if num_auccess_actions > 0:
             logging.info('Start AUCCESS eval')
             stats['train_auccess'] = _eval_and_score_actions(
                 cache, model, eval_train[3], num_auccess_actions,
-                eval_batch_size, eval_train[4])
+                eval_batch_size, eval_train[4], action_paths=train_action_paths)
             if eval_dev:
                 stats['dev_auccess'] = _eval_and_score_actions(
                     cache, model, eval_dev[3], num_auccess_actions,
-                    eval_batch_size, eval_dev[4])
+                    eval_batch_size, eval_dev[4], action_paths=eval_action_paths)
 
         logging.info('__log__: %s', stats)
 
@@ -337,6 +359,10 @@ def train(output_dir,
     losses = []
     last_time = time.time()
     observations = observations.to(device)
+    # CUSTOM
+    train_action_paths = train_action_paths.to(device)
+    eval_action_paths = eval_action_paths.to(device)
+
     actions = actions.pin_memory()
     is_solved = is_solved.pin_memory()
     for batch_id, batch_indices in enumerate(train_indices_sampler(),
@@ -348,11 +374,16 @@ def train(output_dir,
         model.train()
         batch_task_indices = task_indices[batch_indices]
         batch_observations = observations[batch_task_indices]
+
+        # CUSTOM
+        path_choice = np.random.randint(model.path_rng)
+        batch_train_action_paths = train_action_paths[batch_task_indices, path_choice]
+
         batch_actions = actions[batch_indices].to(device, non_blocking=True)
         batch_is_solved = is_solved[batch_indices].to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        loss = model.ce_loss(model(batch_observations, batch_actions),
+        loss = model.ce_loss(model(batch_observations, batch_actions, action_paths=batch_train_action_paths),
                              batch_is_solved)
         loss.backward()
         optimizer.step()
@@ -387,7 +418,7 @@ def get_lr(optimizer):
         return param_group['lr']
 
 
-def eval_loss(model, data, batch_size):
+def eval_loss(model, data, batch_size, action_paths = None):
     task_indices, is_solved, actions, _, observations = data
     losses = []
     observations = observations.to(model.device)
@@ -399,19 +430,26 @@ def eval_loss(model, data, batch_size):
             batch_observations = observations[batch_task_indices]
             batch_actions = actions[batch_indices]
             batch_is_solved = is_solved[batch_indices]
-            loss = model.ce_loss(model(batch_observations, batch_actions),
+            # CUSTOM
+            path_choice = np.random.randint(model.path_rng)
+            batch_action_paths = action_paths[batch_task_indices,path_choice] if action_paths is not None else None
+            loss = model.ce_loss(model(batch_observations, batch_actions, action_paths=batch_action_paths),
                                  batch_is_solved)
             losses.append(loss.item() * len(batch_indices))
     return sum(losses) / len(task_indices)
 
 
-def eval_actions(model, actions, batch_size, observations):
+def eval_actions(model, actions, batch_size, observations, action_path=None):
     scores = []
     with torch.no_grad():
         model.eval()
-        preprocessed = model.preprocess(
-            torch.LongTensor(observations).unsqueeze(0))
         for batch_start in range(0, len(actions), batch_size):
+
+            # CUSTOM
+            path_choice = np.random.randint(model.path_rng)
+            preprocessed = model.preprocess(
+                torch.LongTensor(observations).unsqueeze(0), action_paths=action_path[path_choice,None])
+
             batch_end = min(len(actions), batch_start + batch_size)
             batch_actions = torch.FloatTensor(actions[batch_start:batch_end])
             batch_scores = model(None, batch_actions, preprocessed=preprocessed)
@@ -422,7 +460,7 @@ def eval_actions(model, actions, batch_size, observations):
 
 
 def _eval_and_score_actions(cache, model, simulator, num_actions, batch_size,
-                            observations):
+                            observations, action_paths=None):
     actions = cache.action_array[:num_actions]
     indices = np.random.RandomState(1).permutation(
         len(observations))[:AUCCESS_EVAL_TASKS]
@@ -430,7 +468,7 @@ def _eval_and_score_actions(cache, model, simulator, num_actions, batch_size,
         [simulator.task_ids[index] for index in indices])
     for i, task_index in enumerate(indices):
         scores = eval_actions(model, actions, batch_size,
-                              observations[task_index]).tolist()
+                              observations[task_index], action_path=action_paths[task_index]).tolist()
 
         _, sorted_actions = zip(
             *sorted(zip(scores, actions), key=lambda x: (-x[0], tuple(x[1]))))

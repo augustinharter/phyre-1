@@ -36,6 +36,10 @@ import tqdm
 import phyre
 import neural_agent
 
+import os
+import pickle
+import torch
+
 State = Any
 TaskIds = Tuple[str, ...]
 
@@ -314,6 +318,9 @@ class DQNAgent(AgentWithSimulationCache):
     EVAL_FLAG_NAMES = ('finetune_iterations', 'eval_batch_size',
                        'refine_iterations', 'refine_loss', 'refine_lr',
                        'rank_size')
+    
+    #ACTION_PATH_DIR = '/media/compute/homes/aharter/isy2020/phyre/data/action_path_fold_0'
+    ACTION_PATH_DIR = '/media/compute/homes/aharter/isy2020/phyre/data/template13_action_paths_10x'
 
     @classmethod
     def name(cls):
@@ -406,6 +413,17 @@ class DQNAgent(AgentWithSimulationCache):
 
         simulator = phyre.initialize_simulator(task_ids, tier)
         observations = simulator.initial_scenes
+
+        # CUSTOM
+        if os.path.exists(cls.ACTION_PATH_DIR):
+            with open(cls.ACTION_PATH_DIR+'/channel_paths.pickle', 'rb') as fp:
+                action_path_dict = pickle.load(fp)
+            action_paths = torch.Tensor([action_path_dict[task] if task in action_path_dict else torch.zeros(256,256)
+                for task in task_ids])[:,None].cuda()
+        else:
+            print("can't find action_path_dict!")
+            exit(-1)
+
         assert tuple(task_ids) == simulator.task_ids
 
         logging.info('Ranking %d actions and simulating top %d', len(actions),
@@ -425,7 +443,7 @@ class DQNAgent(AgentWithSimulationCache):
                 refined_actions = actions
             scores = neural_agent.eval_actions(model, refined_actions,
                                                eval_batch_size,
-                                               observations[task_index])
+                                               observations[task_index], action_path=action_paths[task_index])
             # Order of descendig scores.
             action_order = np.argsort(-scores)
             if not refine_iterations > 0:
@@ -476,12 +494,31 @@ class DQNAgent(AgentWithSimulationCache):
             model = neural_agent.load_agent_from_folder(dqn_load_from)
         else:
             train_kwargs, _ = cls._extract_dqn_flags(**kwargs)
+
+            # CUSTOM 
+            if os.path.exists(cls.ACTION_PATH_DIR):
+                with open(cls.ACTION_PATH_DIR+'/channel_paths.pickle', 'rb') as fp:
+                    action_path_dict = pickle.load(fp)
+                train_action_paths = torch.Tensor([action_path_dict[task] if task in action_path_dict else torch.zeros(256,256)
+                    for task in task_ids])[:,None]
+                if dev_tasks_ids is not None:
+                    eval_action_paths = torch.Tensor([action_path_dict[task] if task in action_path_dict else torch.zeros(256,256)
+                        for task in dev_tasks_ids])[:,None]
+                else:
+                    eval_action_paths = None
+            else:
+                print("can't find action_path_dict!")
+                exit(-1)
+
+
             model = neural_agent.train(output_dir,
                                        tier,
                                        task_ids,
                                        cache=cache,
                                        max_train_actions=max_train_actions,
                                        dev_tasks_ids=dev_tasks_ids,
+                                       train_action_paths=train_action_paths,
+                                       eval_action_paths=eval_action_paths,
                                        **train_kwargs)
         if max_train_actions:
             num_actions = max_train_actions

@@ -17,6 +17,9 @@ import torch.nn as nn
 import torchvision
 
 import phyre
+import os
+import pickle
+import numpy as np
 
 USE_CUDA = torch.cuda.is_available()
 DEVICE = torch.device('cuda:0' if USE_CUDA else 'cpu')
@@ -56,7 +59,7 @@ class SimpleNetWithAction(nn.Module):
         super().__init__()
         action_network_kwargs = action_network_kwargs or {}
         self.stem = nn.Sequential(
-            nn.Conv2d(phyre.NUM_COLORS, 3, kernel_size=1, bias=False),
+            nn.Conv2d(phyre.NUM_COLORS+1, 3, kernel_size=1, bias=False),
             nn.BatchNorm2d(3),
             nn.ReLU(inplace=True),
             nn.Conv2d(3, 64, kernel_size=7, stride=4, padding=3, bias=False),
@@ -130,7 +133,7 @@ class ResNet18FilmAction(nn.Module):
                  fusion_place='last'):
         super().__init__()
         net = torchvision.models.resnet18(pretrained=False)
-        conv1 = nn.Conv2d(phyre.NUM_COLORS,
+        conv1 = nn.Conv2d(phyre.NUM_COLORS+1,
                           64,
                           kernel_size=7,
                           stride=2,
@@ -178,8 +181,15 @@ class ResNet18FilmAction(nn.Module):
         else:
             return 'cpu'
 
-    def preprocess(self, observations):
+    def preprocess(self, observations, action_paths=None):
         image = self._image_colors_to_onehot(observations)
+
+        # CUSTOM modification for action path
+        if action_paths is not None:
+            image = torch.cat((image, action_paths), dim=1)            
+        else:
+            assert False, ('No action_paths passed!')
+
         features = self.stem(image)
         for stage, act_layer in zip(self.stages, self.action_networks):
             if act_layer is not None:
@@ -189,9 +199,9 @@ class ResNet18FilmAction(nn.Module):
             features = nn.functional.adaptive_max_pool2d(features, 1)
         return dict(features=features)
 
-    def forward(self, observations, actions, preprocessed=None):
+    def forward(self, observations, actions, preprocessed=None, action_paths=None):
         if preprocessed is None:
-            preprocessed = self.preprocess(observations)
+            preprocessed = self.preprocess(observations, action_paths=action_paths)
         return self._forward(actions, **preprocessed)
 
     def _forward(self, actions, features):
